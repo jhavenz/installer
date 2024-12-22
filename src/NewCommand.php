@@ -2,9 +2,13 @@
 
 namespace Laravel\Installer\Console;
 
+use Illuminate\Contracts\Filesystem\FileNotFoundException;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Composer;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ProcessUtils;
+use Illuminate\Support\Str;
+use Laravel\Installer\Console\Kickstart\Kickstart;
 use RuntimeException;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputArgument;
@@ -13,6 +17,7 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Process\PhpExecutableFinder;
 use Symfony\Component\Process\Process;
+use Throwable;
 
 use function Laravel\Prompts\confirm;
 use function Laravel\Prompts\multiselect;
@@ -30,6 +35,11 @@ class NewCommand extends Command
      * @var \Illuminate\Support\Composer
      */
     protected $composer;
+
+    /**
+     * @var bool
+     */
+    protected $acceptedMigration = false;
 
     /**
      * Configure the command options.
@@ -62,7 +72,8 @@ class NewCommand extends Command
             ->addOption('phpunit', null, InputOption::VALUE_NONE, 'Installs the PHPUnit testing framework')
             ->addOption('prompt-breeze', null, InputOption::VALUE_NONE, 'Issues a prompt to determine if Breeze should be installed (Deprecated)')
             ->addOption('prompt-jetstream', null, InputOption::VALUE_NONE, 'Issues a prompt to determine if Jetstream should be installed (Deprecated)')
-            ->addOption('force', 'f', InputOption::VALUE_NONE, 'Forces install even if the directory already exists');
+            ->addOption('force', 'f', InputOption::VALUE_NONE, 'Forces install even if the directory already exists')
+            ->addOption('kickstart', 'k', InputOption::VALUE_OPTIONAL, 'Choose a pre-defined template to kickstart your application using the power of Laravel Blueprint');
     }
 
     /**
@@ -144,6 +155,20 @@ class NewCommand extends Command
             ) === 'Pest');
         }
 
+        if (!$input->getOption('kickstart')) {
+            $input->setOption('kickstart', select(
+                label: 'Would you like to kickstart this project with a pre-defined template?',
+                options: [
+                    'none' => 'None',
+                    'blog' => 'Blog (Simple relationships)',
+                    'podcast' => 'Podcast (Intermediate relationships)',
+                    'phone-book' => 'Phone Book (Advanced relationships)'
+                ],
+                default: 'none',
+                hint: "Powered by the laravel-shift/blueprint library as a dev dependency"
+            ));
+        }
+
         // if (! $input->getOption('git') && $input->getOption('github') === false && Process::fromShellCommandline('git --version')->run() === 0) {
         //     $input->setOption('git', confirm(label: 'Would you like to initialize a Git repository?', default: false));
         // }
@@ -156,7 +181,7 @@ class NewCommand extends Command
      * @param  \Symfony\Component\Console\Output\OutputInterface  $output
      * @return void
      *
-     * @throws \RuntimeException
+     * @throws RuntimeException
      */
     protected function ensureExtensionsAreAvailable(InputInterface $input, OutputInterface $output): void
     {
@@ -176,7 +201,7 @@ class NewCommand extends Command
             return;
         }
 
-        throw new \RuntimeException(
+        throw new RuntimeException(
             sprintf('The following PHP extensions are required but are not installed: %s', $missingExtensions->join(', ', ', and '))
         );
     }
@@ -238,23 +263,12 @@ class NewCommand extends Command
                     $directory.'/.env'
                 );
 
-                [$database, $migrate] = $this->promptForDatabaseOptions($directory, $input);
+                [$database, $this->acceptedMigration] = $this->promptForDatabaseOptions($directory, $input);
 
                 $this->configureDefaultDatabaseConnection($directory, $database, $name);
 
-                if ($migrate) {
-                    if ($database === 'sqlite') {
-                        touch($directory.'/database/database.sqlite');
-                    }
-
-                    $commands = [
-                        trim(sprintf(
-                            $this->phpBinary().' artisan migrate %s',
-                            ! $input->isInteractive() ? '--no-interaction' : '',
-                        )),
-                    ];
-
-                    $this->runCommands($commands, $input, $output, workingPath: $directory);
+                if ($this->acceptedMigration) {
+                    $commands = $this->migrate($database, $directory, $input, $output);
                 }
             }
 
@@ -268,6 +282,10 @@ class NewCommand extends Command
                 $this->installJetstream($directory, $input, $output);
             } elseif ($input->getOption('pest')) {
                 $this->installPest($directory, $input, $output);
+            }
+
+            if ($input->getOption('kickstart') !== 'none') {
+                $this->runKickstart($directory, $input, $output);
             }
 
             if ($input->getOption('github') !== false) {
@@ -1017,5 +1035,115 @@ class NewCommand extends Command
             $file,
             preg_replace($pattern, $replace, file_get_contents($file))
         );
+    }
+
+    /**
+     * @param  string  $directory
+     * @param  InputInterface  $input
+     * @param  OutputInterface  $output
+     * @return void
+     * @throws FileNotFoundException
+     */
+    private function runKickstart(string $directory, InputInterface $input, OutputInterface $output)
+    {
+        $kickstart = new Kickstart(
+            $directory,
+            $input->getOption('kickstart'),
+            $input->getOption('teams'),
+        );
+
+        $seederClass = basename($kickstart->path->toProjectSeederFile(), '.php');
+
+        $seed = $this->acceptedMigration && confirm(
+            label: "Would you like to run pending migrations and seed the {$kickstart->draft->template()} kickstart template?",
+            default: true,
+            hint: "Or, run this seeder when ready with `php artisan db:seed --class={$seederClass}`"
+        );
+
+        $kickstart->copyDraftStubToProject();
+
+        $commands = array_filter([
+            Str::squish(sprintf("%s artisan install:api %s",
+                $this->phpBinary(),
+                $seed || (!$input->isInteractive() && $this->canConnectToDatabase($input))
+                    ? '--no-interaction'
+                    : (!$this->canConnectToDatabase($input)
+                        ? '--without-migration-prompt'
+                        : ''),
+            )),
+            $this->findComposer().' require laravel-shift/blueprint jasonmccreary/laravel-test-assertions --dev',
+            "echo '{$directory}/draft.yaml' >> .gitignore",
+            "echo '{$directory}/.blueprint' >> .gitignore",
+            $this->phpBinary()." artisan vendor:publish --tag=blueprint-config",
+            $this->phpBinary()." artisan blueprint:build {$kickstart->draft->filePath()}",
+        ]);
+
+        $this->runCommands($commands, $input, $output, workingPath: $directory);
+
+        $kickstart->deleteGenericSeeders();
+
+        $kickstart->addTemplateSeederToProject();
+
+        $this->commitChanges('Kickstart Initialized', $directory, $input, $output);
+
+        if ($seed) {
+            $this->runCommands([$this->phpBinary()." artisan migrate"], $input, $output, workingPath: $directory);
+
+            if ($bypassMsg = $kickstart->scanRequiredMigrations()) {
+                $output->writeln('  <bg=yellow;fg=black> WARN </> '.$bypassMsg.PHP_EOL);
+            } else {
+                $this->runCommands([$this->phpBinary()." artisan db:seed --class={$seederClass}"], $input, $output, workingPath: $directory);
+
+                $this->commitChanges('Kickstart Seeded', $directory, $input, $output);
+            }
+        }
+
+        $output->writeln("  <bg=blue;fg=white> INFO </> Kickstart successful!! 🚀.".PHP_EOL);
+    }
+
+    /**
+     * @param  string  $database
+     * @param  string  $directory
+     * @param  InputInterface  $input
+     * @param  OutputInterface  $output
+     * @return array
+     */
+    private function migrate(string $database, string $directory, InputInterface $input, OutputInterface $output)
+    {
+        if ($database === 'sqlite') {
+            touch($directory.'/database/database.sqlite');
+        }
+
+        $commands = [
+            trim(sprintf(
+            $this->phpBinary().' artisan migrate %s',
+            !$input->isInteractive() ? '--no-interaction' : '',
+            )),
+        ];
+
+        $this->runCommands($commands, $input, $output, workingPath: $directory);
+
+        return $commands;
+    }
+
+    /**
+     * @return bool
+     */
+    private function canConnectToDatabase(InputInterface $input)
+    {
+        static $cache;
+
+        if (isset($cache)) {
+            return $cache;
+        }
+
+
+        try {
+            DB::select('SELECT 1');
+
+            return $cache = true;
+        } catch (Throwable) {
+            return $cache = false;
+        }
     }
 }
